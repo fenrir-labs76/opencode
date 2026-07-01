@@ -1715,7 +1715,10 @@ describe("ProviderTransform.message - surrogate sanitization", () => {
     api: {
       id: "test-model",
       url: "https://api.test.com",
-      npm: "@ai-sdk/openai-compatible",
+      // Use @ai-sdk/openai so reasoning parts are preserved for sanitization assertions.
+      // The surrogate sanitization logic is provider-agnostic; @ai-sdk/openai-compatible
+      // is tested separately for its reasoning-strip behaviour.
+      npm: "@ai-sdk/openai",
     },
     name: "Test Model",
     capabilities: {
@@ -4738,5 +4741,151 @@ describe("ProviderTransform.providerOptions - ai-gateway-provider", () => {
     // which @ai-sdk/openai-compatible never reads, silently dropping reasoningEffort.
     const result = ProviderTransform.providerOptions(createModel(), { reasoningEffort: "high" })
     expect(result).toEqual({ openaiCompatible: { reasoningEffort: "high" } })
+  })
+})
+
+describe("ProviderTransform.message - openai-compatible reasoning strip", () => {
+  // The @ai-sdk/openai-compatible SDK unconditionally extracts both `reasoning_content`
+  // and `reasoning` fields from API responses into typed reasoning content parts.
+  // On follow-up turns it re-serialises those parts back as `reasoning_content` in the
+  // request body. Custom deployments (e.g. ollama running qwen3) return a `reasoning`
+  // field but do not accept `reasoning_content` back in message history, causing the
+  // conversation to hang with no output returned to the user.
+  // When `interleaved` is not explicitly configured as an object with a field name,
+  // opencode strips the reasoning parts before the SDK ever sees them so that
+  // `reasoning_content` is never injected into subsequent requests.
+
+  const createModel = (interleaved: any) =>
+    ({
+      id: "custom-provider/thinking-model",
+      providerID: "custom-provider",
+      api: {
+        id: "thinking-model",
+        url: "http://localhost:11434/v1",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      name: "Thinking Model",
+      capabilities: {
+        temperature: true,
+        reasoning: true,
+        attachment: false,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved,
+      },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: { context: 128000, output: 8192 },
+      status: "active",
+      options: {},
+      headers: {},
+      release_date: "",
+    }) as any
+
+  // Fixture modelled on a real Qwen3.6-35b response to a complex technical prompt
+  // ("Explain in detail how distributed consensus algorithms work. Compare PBFT,
+  // Tendermint, and Raft protocols, their tradeoffs, fault tolerance models, and
+  // real-world applications. Walk through a concrete example of message ordering in
+  // each protocol.") — the kind of prompt that reliably produces a non-empty reasoning
+  // field, which is what triggers the reasoning_content injection bug.
+  const msgsWithReasoning = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "reasoning",
+          text: "The user wants a detailed comparison of PBFT, Tendermint, and Raft. I need to cover fault tolerance models (Byzantine vs crash-fault), message complexity (O(n²) for PBFT), leader election in Raft, Tendermint's block finality, and concrete message-ordering walk-throughs for each protocol.",
+        },
+        {
+          type: "text",
+          text: "Distributed consensus algorithms allow nodes in a network to agree on a single value despite failures.\n\n**PBFT** tolerates Byzantine faults with 3f+1 nodes via a three-phase pre-prepare/prepare/commit protocol.\n**Tendermint** extends that model for blockchains, adding propose/prevote/precommit rounds with instant finality.\n**Raft** targets crash-fault tolerance only, prioritising understandability through strong leader election and log replication.",
+        },
+      ],
+    },
+  ] as any[]
+
+  test("strips reasoning parts when interleaved is false", () => {
+    const result = ProviderTransform.message(msgsWithReasoning, createModel(false), {})
+    expect(result[0].content).toEqual([{ type: "text", text: msgsWithReasoning[0].content[1].text }])
+    // No providerOptions set means the SDK will not inject reasoning_content
+    expect(result[0].providerOptions?.openaiCompatible?.reasoning_content).toBeUndefined()
+  })
+
+  test("strips reasoning parts when interleaved is true (no field configured)", () => {
+    const result = ProviderTransform.message(msgsWithReasoning, createModel(true), {})
+    expect(result[0].content).toEqual([{ type: "text", text: msgsWithReasoning[0].content[1].text }])
+  })
+
+  test("leaves non-reasoning parts intact when stripping", () => {
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "Thinking..." },
+          { type: "text", text: "Part one." },
+          { type: "tool-call", toolCallId: "call-1", toolName: "bash", input: { command: "ls" } },
+          { type: "reasoning", text: "More thinking..." },
+          { type: "text", text: "Part two." },
+        ],
+      },
+    ] as any[]
+    const result = ProviderTransform.message(msgs, createModel(false), {})
+    expect(result[0].content).toEqual([
+      { type: "text", text: "Part one." },
+      { type: "tool-call", toolCallId: "call-1", toolName: "bash", input: { command: "ls" } },
+      { type: "text", text: "Part two." },
+    ])
+  })
+
+  test("uses interleaved path when field is configured - serialises into providerOptions instead of stripping", () => {
+    // When interleaved: { field: "reasoning" } is set the existing interleaved block
+    // runs: reasoning parts are removed from content and the text is placed in
+    // providerOptions.openaiCompatible.reasoning so the API receives the correct field.
+    const result = ProviderTransform.message(msgsWithReasoning, createModel({ field: "reasoning" }), {})
+    expect(result[0].content).toEqual([{ type: "text", text: msgsWithReasoning[0].content[1].text }])
+    expect(result[0].providerOptions?.openaiCompatible?.reasoning).toBe(msgsWithReasoning[0].content[0].text)
+  })
+
+  test("uses interleaved path for reasoning_content field", () => {
+    const result = ProviderTransform.message(msgsWithReasoning, createModel({ field: "reasoning_content" }), {})
+    expect(result[0].content).toEqual([{ type: "text", text: msgsWithReasoning[0].content[1].text }])
+    expect(result[0].providerOptions?.openaiCompatible?.reasoning_content).toBe(msgsWithReasoning[0].content[0].text)
+  })
+
+  test("does not affect other providers: @ai-sdk/openai leaves reasoning unchanged", () => {
+    const openaiModel = createModel(false)
+    openaiModel.api = { id: "gpt-4", url: "https://api.openai.com", npm: "@ai-sdk/openai" }
+    const result = ProviderTransform.message(msgsWithReasoning, openaiModel, {})
+    expect(result[0].content).toEqual([
+      { type: "reasoning", text: msgsWithReasoning[0].content[0].text },
+      { type: "text", text: msgsWithReasoning[0].content[1].text },
+    ])
+  })
+
+  test("does not strip for messages without reasoning parts (no-op)", () => {
+    const msgs = [
+      { role: "assistant", content: [{ type: "text", text: "Plain response." }] },
+    ] as any[]
+    const result = ProviderTransform.message(msgs, createModel(false), {})
+    expect(result[0].content).toEqual([{ type: "text", text: "Plain response." }])
+  })
+
+  test("user messages are not affected", () => {
+    const msgs = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "Hello" }],
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "Thinking..." },
+          { type: "text", text: "Hi there." },
+        ],
+      },
+    ] as any[]
+    const result = ProviderTransform.message(msgs, createModel(false), {})
+    expect(result[0].content).toEqual([{ type: "text", text: "Hello" }])
+    expect(result[1].content).toEqual([{ type: "text", text: "Hi there." }])
   })
 })
